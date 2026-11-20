@@ -1,0 +1,23 @@
+[Unit]
+Description=Telegram payroll bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=CHANGE_ME
+WorkingDirectory=/opt/payroll-bot
+EnvironmentFile=/opt/payroll-bot/.env
+ExecStart=/opt/payroll-bot/.venv/bin/python /opt/payroll-bot/payroll_bot.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/payroll-bot
+
+[Install]
+WantedBy=multi-user.target
