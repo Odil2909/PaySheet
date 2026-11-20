@@ -74,9 +74,13 @@ MAX_XLSX_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
 WEEK_ID_PATTERN = re.compile(r"^\d{4}-W(?:0[1-9]|[1-4]\d|5[0-3])$")
 logger = logging.getLogger(__name__)
 MENU_BUTTONS = {
+    "📊 Расчётный лист",
+    "⚠️ Штрафы",
     "📅 Текущая неделя",
     "📅 Предыдущая неделя",
+    "📦 Пики",
     "📦 Работа и пики",
+    "⬅️ Назад",
     "🔐 Войти",
     "🚪 Выйти",
     "📤 Загрузить Excel",
@@ -141,11 +145,9 @@ def normalize_name(value: str) -> str:
 
 def keyboard(owner: bool = False) -> ReplyKeyboardMarkup:
     rows = [
-        [
-            KeyboardButton(text="📅 Текущая неделя"),
-            KeyboardButton(text="📅 Предыдущая неделя"),
-        ],
-        [KeyboardButton(text="📦 Работа и пики")],
+        [KeyboardButton(text="📊 Расчётный лист")],
+        [KeyboardButton(text="⚠️ Штрафы")],
+        [KeyboardButton(text="📦 Пики")],
         [KeyboardButton(text="🔐 Войти"), KeyboardButton(text="🚪 Выйти")],
     ]
     if owner:
@@ -162,6 +164,35 @@ def keyboard(owner: bool = False) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=rows,
         resize_keyboard=True,
+    )
+
+
+def report_week_picker(section: str) -> InlineKeyboardMarkup:
+    current_week, previous_week = work_week_ids()
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📅 Текущая неделя",
+                    callback_data=f"report:week:{section}:{current_week}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📅 Предыдущая неделя",
+                    callback_data=f"report:week:{section}:{previous_week}",
+                )
+            ],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="report:back")],
+        ]
+    )
+
+
+def report_back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="report:back")]
+        ]
     )
 
 
@@ -288,6 +319,9 @@ async def discard_pending_upload(state: FSMContext, admin_id: int | None) -> Non
     token = data.get("upload_token")
     if token and admin_id:
         database.delete_staged_payroll_upload(token, admin_id)
+    activity_token = data.get("activity_upload_token")
+    if activity_token and admin_id:
+        database.delete_staged_activity_upload(activity_token, admin_id)
 
 
 async def clear_workflow(state: FSMContext, telegram_id: int | None) -> None:
@@ -623,6 +657,352 @@ def parse_workbook(content: bytes) -> tuple[list[str], list[tuple[str, str, list
     return headers, rows
 
 
+def report_header(value: Any) -> str:
+    return normalize_name(cell_text(value)).replace("ё", "е")
+
+
+def report_date(value: Any) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = cell_text(value)
+    if text == "—":
+        return None
+    try:
+        return datetime.fromisoformat(text).date()
+    except ValueError:
+        try:
+            return date.fromisoformat(text[:10])
+        except ValueError:
+            return None
+
+
+def report_decimal(value: Any, label: str, row_number: int) -> Decimal:
+    text = cell_text(value).replace("\u00a0", "").replace(" ", "")
+    if text == "—":
+        raise ValueError(f"{label}, строка {row_number}: значение не указано.")
+    if isinstance(value, str) and "," in text:
+        if "." in text and text.rfind(",") > text.rfind("."):
+            text = text.replace(".", "").replace(",", ".")
+        elif "." in text:
+            text = text.replace(",", "")
+        else:
+            text = text.replace(",", ".")
+    try:
+        number = Decimal(text)
+    except InvalidOperation as exc:
+        raise ValueError(f"{label}, строка {row_number}: ожидается число.") from exc
+    if not number.is_finite() or number < 0:
+        raise ValueError(f"{label}, строка {row_number}: число должно быть неотрицательным.")
+    return number
+
+
+def decimal_text(value: Decimal) -> str:
+    return format(value.normalize(), "f") if value else "0"
+
+
+def excel_report_login(value: Any) -> tuple[str, str] | None:
+    login = cell_text(value).strip()
+    if login == "—":
+        return None
+    if len(login) > 200:
+        raise ValueError("Логин в Excel длиннее 200 символов.")
+    return normalize_name(login), login
+
+
+def parse_report_workbook(content: bytes) -> dict[str, Any] | None:
+    validate_xlsx_container(content)
+    workbook = load_workbook(io.BytesIO(content), data_only=True, read_only=True)
+    try:
+        sheets = {
+            normalize_name(sheet.title).replace("ё", "е"): sheet
+            for sheet in workbook.worksheets
+        }
+        source_sheets = {
+            title: sheets[title]
+            for title in ("salary", "ntt", "mistakes")
+            if title in sheets
+        }
+        if not source_sheets:
+            return None
+
+        activities: dict[tuple[str, str, str, str, str], Decimal] = {}
+        logins: dict[str, str] = {}
+        mistake_rows: list[dict[str, Any]] = []
+        source_counts = {"Salary": 0, "NTT": 0, "Mistakes": 0}
+        for source_title in ("salary", "ntt"):
+            sheet = sheets.get(source_title)
+            if sheet is None:
+                continue
+            source_name = "Salary" if source_title == "salary" else "NTT"
+            iterator = sheet.iter_rows(values_only=True)
+            headers = next(iterator, ())
+            normalized_headers = [report_header(value) for value in headers]
+            process_index = next(
+                (index for index, value in enumerate(normalized_headers) if value == "process"),
+                None,
+            )
+            login_index = next(
+                (index for index, value in enumerate(normalized_headers) if value == "login"),
+                None,
+            )
+            date_columns: list[tuple[int, date]] = []
+            for index, value in enumerate(headers):
+                parsed_date = report_date(value)
+                if parsed_date is not None and index not in {process_index, login_index}:
+                    date_columns.append((index, parsed_date))
+            if process_index is None or login_index is None or not date_columns:
+                raise ValueError(
+                    f"Лист «{sheet.title}»: нужны колонки Process, Login и даты."
+                )
+
+            for row_number, row in enumerate(iterator, start=2):
+                if not row or all(value is None for value in row):
+                    continue
+                identity = excel_report_login(
+                    row[login_index] if login_index < len(row) else None
+                )
+                if identity is None:
+                    continue
+                normalized_login, display_login = identity
+                process = cell_text(
+                    row[process_index] if process_index < len(row) else None
+                ).strip()
+                if process == "—":
+                    raise ValueError(f"Лист «{sheet.title}», строка {row_number}: нет Process.")
+                logins.setdefault(normalized_login, display_login)
+                for column_index, activity_day in date_columns:
+                    value = row[column_index] if column_index < len(row) else None
+                    if value is None or cell_text(value) == "—":
+                        continue
+                    quantity = report_decimal(value, f"Лист «{sheet.title}»", row_number)
+                    key = (
+                        f"{activity_day.isocalendar().year}-W{activity_day.isocalendar().week:02d}",
+                        normalized_login,
+                        activity_day.isoformat(),
+                        source_name,
+                        process,
+                    )
+                    activities[key] = activities.get(key, Decimal("0")) + quantity
+                    source_counts[source_name] += 1
+
+        mistake_sheet = sheets.get("mistakes")
+        if mistake_sheet is not None:
+            iterator = mistake_sheet.iter_rows(values_only=True)
+            headers = next(iterator, ())
+            normalized_headers = [report_header(value) for value in headers]
+
+            def column_index(predicate: Any) -> int | None:
+                return next(
+                    (index for index, value in enumerate(normalized_headers) if predicate(value)),
+                    None,
+                )
+
+            login_index = column_index(
+                lambda value: "login" in value and "наруш" in value
+            )
+            occurred_index = column_index(lambda value: "дата совершения" in value)
+            detected_index = column_index(lambda value: "дата выявления" in value)
+            violation_index = column_index(lambda value: value == "нарушение")
+            if login_index is None or occurred_index is None or violation_index is None:
+                raise ValueError(
+                    "Лист «Mistakes»: нужны Login (нарушитель), "
+                    "«Дата совершения нарушения» и «Нарушение»."
+                )
+            process_index = column_index(lambda value: value == "процесс")
+            point_index = column_index(lambda value: value == "пункт")
+            comment_index = column_index(lambda value: value == "комментарий")
+            unit_index = column_index(lambda value: "unitload" in value or "контейнер" in value)
+            quantity_index = column_index(
+                lambda value: "количество единиц" in value or "количество нарушений" in value
+            )
+            for row_number, row in enumerate(iterator, start=2):
+                if not row or all(value is None for value in row):
+                    continue
+                identity = excel_report_login(
+                    row[login_index] if login_index < len(row) else None
+                )
+                if identity is None:
+                    continue
+                normalized_login, display_login = identity
+                occurred = report_date(
+                    row[occurred_index] if occurred_index < len(row) else None
+                )
+                detected = (
+                    report_date(row[detected_index] if detected_index < len(row) else None)
+                    if detected_index is not None
+                    else None
+                )
+                if occurred is None:
+                    occurred = detected
+                if occurred is None:
+                    raise ValueError(
+                        f"Лист «Mistakes», строка {row_number}: не указана дата нарушения."
+                    )
+                raw_quantity = (
+                    row[quantity_index]
+                    if quantity_index is not None and quantity_index < len(row)
+                    else None
+                )
+                quantity = (
+                    decimal_text(report_decimal(raw_quantity, "Лист «Mistakes»", row_number))
+                    if raw_quantity is not None and cell_text(raw_quantity) != "—"
+                    else "1"
+                )
+                violation = cell_text(
+                    row[violation_index] if violation_index < len(row) else None
+                ).strip()
+                if violation == "—":
+                    raise ValueError(
+                        f"Лист «Mistakes», строка {row_number}: не указано нарушение."
+                    )
+                logins.setdefault(normalized_login, display_login)
+                week = occurred.isocalendar()
+                week_id = f"{week.year}-W{week.week:02d}"
+                mistake_rows.append(
+                    {
+                        "week_id": week_id,
+                        "login": normalized_login,
+                        "source_row": row_number,
+                        "occurred_on": occurred.isoformat(),
+                        "identified_on": detected.isoformat() if detected else None,
+                        "process": cell_text(
+                            row[process_index] if process_index is not None and process_index < len(row) else None
+                        ),
+                        "point": cell_text(
+                            row[point_index] if point_index is not None and point_index < len(row) else None
+                        ),
+                        "violation": violation,
+                        "comment": cell_text(
+                            row[comment_index] if comment_index is not None and comment_index < len(row) else None
+                        ),
+                        "unit_identifier": cell_text(
+                            row[unit_index] if unit_index is not None and unit_index < len(row) else None
+                        ),
+                        "quantity": quantity,
+                    }
+                )
+                source_counts["Mistakes"] += 1
+
+        rate_sheet = sheets.get("rates")
+        rates: dict[str, str] = {}
+        if rate_sheet is not None:
+            iterator = rate_sheet.iter_rows(values_only=True)
+            headers = [report_header(value) for value in next(iterator, ())]
+            process_index = next(
+                (i for i, value in enumerate(headers) if value in {"process", "процесс"}),
+                None,
+            )
+            rate_index = next(
+                (
+                    i
+                    for i, value in enumerate(headers)
+                    if any(term in value for term in ("ставка", "цена за единиц", "rate", "amount per unit"))
+                ),
+                None,
+            )
+            if process_index is None or rate_index is None:
+                raise ValueError("Лист «Rates»: нужны колонки Process и «Ставка за единицу».")
+            for row_number, row in enumerate(iterator, start=2):
+                if not row or all(value is None for value in row):
+                    continue
+                process = cell_text(row[process_index] if process_index < len(row) else None)
+                if process == "—":
+                    raise ValueError(f"Лист «Rates», строка {row_number}: не указан Process.")
+                rate = report_decimal(
+                    row[rate_index] if rate_index < len(row) else None,
+                    "Лист «Rates»",
+                    row_number,
+                )
+                process_key = process.strip().casefold()
+                if process_key in rates:
+                    raise ValueError(f"Лист «Rates»: Process «{process}» указан повторно.")
+                rates[process_key] = decimal_text(rate)
+
+        fine_sheet = sheets.get("finerates") or sheets.get("ставки штрафов")
+        fine_rates: dict[str, str] = {}
+        if fine_sheet is not None:
+            iterator = fine_sheet.iter_rows(values_only=True)
+            headers = [report_header(value) for value in next(iterator, ())]
+            violation_index = next(
+                (i for i, value in enumerate(headers) if value in {"нарушение", "violation"}),
+                None,
+            )
+            rate_index = next(
+                (
+                    i
+                    for i, value in enumerate(headers)
+                    if any(term in value for term in ("сумма", "штраф", "rate", "amount"))
+                ),
+                None,
+            )
+            if violation_index is None or rate_index is None:
+                raise ValueError(
+                    "Лист «FineRates»: нужны колонки «Нарушение» и «Сумма за единицу»."
+                )
+            for row_number, row in enumerate(iterator, start=2):
+                if not row or all(value is None for value in row):
+                    continue
+                violation = cell_text(
+                    row[violation_index] if violation_index < len(row) else None
+                )
+                if violation == "—":
+                    raise ValueError(
+                        f"Лист «FineRates», строка {row_number}: не указано нарушение."
+                    )
+                amount = report_decimal(
+                    row[rate_index] if rate_index < len(row) else None,
+                    "Лист «FineRates»",
+                    row_number,
+                )
+                violation_key = violation.strip().casefold()
+                if violation_key in fine_rates:
+                    raise ValueError(
+                        f"Лист «FineRates»: нарушение «{violation}» указано повторно."
+                    )
+                fine_rates[violation_key] = decimal_text(amount)
+
+        periods: dict[str, dict[str, list[Any]]] = {}
+        for (week_id, login, activity_day, source_name, process), quantity in activities.items():
+            weekly = periods.setdefault(
+                week_id, {"activities": [], "mistakes": [], "rates": [], "fine_rates": []}
+            )
+            weekly["activities"].append(
+                {
+                    "login": login,
+                    "date": activity_day,
+                    "source": source_name,
+                    "process": process,
+                    "quantity": decimal_text(quantity),
+                }
+            )
+        for row in mistake_rows:
+            week_id = row.pop("week_id")
+            periods.setdefault(
+                week_id, {"activities": [], "mistakes": [], "rates": [], "fine_rates": []}
+            )["mistakes"].append(row)
+        for weekly in periods.values():
+            weekly["rates"] = sorted(rates.items())
+            weekly["fine_rates"] = sorted(fine_rates.items())
+        if not periods:
+            raise ValueError("В листах Salary, NTT и Mistakes нет датированных данных.")
+        return {
+            "weeks": sorted(periods),
+            "periods": periods,
+            "sheets": sorted(sheets),
+            "logins": [
+                {"normalized": normalized, "display": display}
+                for normalized, display in sorted(logins.items())
+            ],
+            "source_counts": source_counts,
+            "has_rates": rate_sheet is not None,
+            "has_fine_rates": fine_sheet is not None,
+        }
+    finally:
+        workbook.close()
+
+
 def parse_work_sheet(
     workbook: Any, payroll_employee_names: set[str]
 ) -> list[tuple[str, str, str, str]]:
@@ -795,6 +1175,170 @@ def render_work(
     return "\n".join(lines)
 
 
+def render_activity_report(
+    week_id: str,
+    rows: list[dict[str, str]],
+    rates: dict[str, str],
+) -> str:
+    if not rows:
+        return f"За неделю {week_label(week_id)} данных о работе нет."
+    days: dict[str, dict[str, Any]] = {}
+    total_processed = Decimal("0")
+    total_ntt = Decimal("0")
+    process_totals: dict[tuple[str, str], Decimal] = {}
+    missing_rates: set[str] = set()
+    for row in rows:
+        day = row["activity_date"]
+        process_key = row["process"].strip().casefold()
+        quantity = Decimal(row["quantity"])
+        summary = days.setdefault(
+            day,
+            {"quantity": Decimal("0"), "pay": Decimal("0"), "missing_rates": set()},
+        )
+        summary["quantity"] += quantity
+        process_key_pair = (row["source"], row["process"])
+        process_totals[process_key_pair] = (
+            process_totals.get(process_key_pair, Decimal("0")) + quantity
+        )
+        if row["source"] == "Salary":
+            total_processed += quantity
+        elif row["source"] == "NTT":
+            total_ntt += quantity
+        rate = rates.get(process_key)
+        if rate is None:
+            missing_rates.add(row["process"])
+            summary["missing_rates"].add(row["process"])
+        else:
+            summary["pay"] += quantity * Decimal(rate)
+
+    lines = [
+        "📊 Расчётный лист",
+        f"📅 Неделя: {week_label(week_id)}",
+        "",
+        "━━━━━━━━━━━━━━",
+        "",
+    ]
+    for day, summary in sorted(days.items()):
+        parsed_day = date.fromisoformat(day)
+        if summary["missing_rates"]:
+            missing_for_day = ", ".join(sorted(summary["missing_rates"])[:3])
+            if len(summary["missing_rates"]) > 3:
+                missing_for_day += " и другие"
+            pay_text = f"не рассчитано (нет тарифа: {missing_for_day})"
+        else:
+            pay_text = format_amount(summary["pay"])
+        lines.append(f"📅 {parsed_day:%d.%m} — {pay_text}")
+    lines.extend(["", "━━━━━━━━━━━━━━", ""])
+    lines.append(f"📦 Обработано товаров: {format_quantity(total_processed)}")
+    if total_ntt:
+        lines.append(f"Дополнительно NTT: {format_quantity(total_ntt)} операций")
+    if process_totals:
+        lines.extend(["", "Выполненная работа:"])
+        for (source, process), quantity in sorted(process_totals.items()):
+            lines.append(
+                f"• {process}: {format_quantity(quantity)}"
+                + (" шт." if source == "Salary" else " (NTT)")
+            )
+
+    if missing_rates:
+        missing_preview = ", ".join(sorted(missing_rates)[:5])
+        more = len(missing_rates) - 5
+        if more > 0:
+            missing_preview += f" и ещё {more}"
+        lines.append(
+            "💰 ИТОГО: не рассчитано — нет ставок для всех процессов "
+            f"({missing_preview})."
+        )
+    else:
+        total_pay = sum((item["pay"] for item in days.values()), Decimal("0"))
+        lines.append(f"💰 ИТОГО: {format_amount(total_pay)}")
+    return "\n".join(lines)
+
+
+def render_fines_report(week_id: str, rows: list[dict[str, str]]) -> str:
+    lines = [
+        "⚠️ Штрафы",
+        f"📅 Неделя: {week_label(week_id)}",
+        "",
+        "━━━━━━━━━━━━━━",
+        "",
+    ]
+    if not rows:
+        lines.append("За эту неделю нарушений не зарегистрировано.")
+        lines.extend(["", "━━━━━━━━━━━━━━", "", "💰 Общая сумма штрафов: 0.00"])
+        return "\n".join(lines)
+
+    total = Decimal("0")
+    missing_rates = 0
+    for row in rows:
+        lines.extend(
+            [
+                f"📅 {date.fromisoformat(row['occurred_on']):%d.%m}",
+                f"Причина: {row['violation']}",
+            ]
+        )
+        if row["point"] != "—":
+            lines.append(f"Пункт: {row['point']}")
+        quantity = Decimal(row["quantity"])
+        lines.append(f"Количество: {format_quantity(quantity)}")
+        if row["fine_rate"] is None:
+            missing_rates += 1
+            lines.append("Сумма: тариф штрафа не указан в Excel")
+        else:
+            amount = quantity * Decimal(row["fine_rate"])
+            total += amount
+            lines.append(f"Сумма: {format_amount(amount)}")
+        if row["comment"] != "—":
+            lines.append(f"Комментарий: {row['comment']}")
+        lines.append("")
+
+    lines.extend(["━━━━━━━━━━━━━━", ""])
+    if missing_rates:
+        lines.append(
+            f"💰 Общая сумма штрафов: сумма не полная — "
+            f"не указаны тарифы для {missing_rates} нарушений."
+        )
+    else:
+        lines.append(f"💰 Общая сумма штрафов: {format_amount(total)}")
+    return "\n".join(lines)
+
+
+def render_picks_report(week_id: str, rows: list[dict[str, str]]) -> str:
+    picking_rows = [
+        row
+        for row in rows
+        if row["source"] == "Salary" and "pick" in row["process"].casefold()
+    ]
+    lines = [
+        "📦 Пики",
+        f"📅 Неделя: {week_label(week_id)}",
+        "",
+        "━━━━━━━━━━━━━━",
+        "",
+    ]
+    if not picking_rows:
+        lines.extend(["За эту неделю данные о пиках не найдены.", "", "Итого пиков: 0"])
+        return "\n".join(lines)
+
+    totals: dict[str, Decimal] = {}
+    total = Decimal("0")
+    for row in picking_rows:
+        quantity = Decimal(row["quantity"])
+        totals[row["activity_date"]] = totals.get(row["activity_date"], Decimal("0")) + quantity
+        total += quantity
+    for day, quantity in sorted(totals.items()):
+        lines.append(
+            f"📅 {date.fromisoformat(day):%d.%m} — {format_quantity(quantity)} шт."
+        )
+        lines.extend(
+            f"  • {row['process']}: {format_quantity(row['quantity'])} шт."
+            for row in picking_rows
+            if row["activity_date"] == day
+        )
+    lines.extend(["", "━━━━━━━━━━━━━━", "", f"Итого пиков: {format_quantity(total)} шт."])
+    return "\n".join(lines)
+
+
 @router.message(Command("start"))
 async def start(message: Message, state: FSMContext) -> None:
     await discard_pending_upload(state, message.from_user.id if message.from_user else None)
@@ -810,7 +1354,7 @@ async def start(message: Message, state: FSMContext) -> None:
         )
         return
     await message.answer(
-        "Здравствуйте! Нажмите «🔐 Войти» и укажите ФИО и пароль."
+        "Здравствуйте! Нажмите «🔐 Войти» и укажите логин из Excel и пароль."
         if not owner
         else "Меню администратора открыто. Для личного расчета нажмите «🔐 Войти».",
         reply_markup=keyboard(owner),
@@ -829,7 +1373,9 @@ async def login_start(message: Message, state: FSMContext) -> None:
         return
     await state.set_state(Login.name)
     log_action(message, "login_started")
-    await message.answer("Введите ФИО так, как оно указано в расчетном листе.")
+    await message.answer(
+        "Введите логин из колонки Login Excel или ФИО, если у вас старый аккаунт."
+    )
 
 
 @router.message(F.text.in_({"🔐 Войти", "Войти"}))
@@ -925,6 +1471,130 @@ async def logout(message: Message, state: FSMContext) -> None:
         "Вы вышли из аккаунта. Для повторного входа нажмите «🔐 Войти».",
         reply_markup=keyboard(is_admin(message)),
     )
+
+
+@router.message(
+    F.text.in_({"📊 Расчётный лист", "⚠️ Штрафы", "📦 Пики"})
+)
+async def select_report(message: Message, state: FSMContext) -> None:
+    await clear_workflow(state, message.from_user.id if message.from_user else None)
+    if not is_private(message):
+        await message.answer("Отчёты доступны только в личном чате с ботом.")
+        return
+    if not message.from_user or not _is_linked_telegram_id(message.from_user.id):
+        await message.answer("Сначала войдите кнопкой «🔐 Войти».")
+        return
+    section = {
+        "📊 Расчётный лист": "salary",
+        "⚠️ Штрафы": "fines",
+        "📦 Пики": "picks",
+    }[message.text or ""]
+    log_action(message, f"report_picker:{section}")
+    await message.answer(
+        "Выберите период:", reply_markup=report_week_picker(section)
+    )
+
+
+@router.callback_query(F.data.startswith("report:"))
+async def select_report_week(callback: CallbackQuery) -> None:
+    if (
+        not callback.from_user
+        or not callback.message
+        or not hasattr(callback.message, "chat")
+        or callback.message.chat.type != "private"
+    ):
+        await callback.answer("Отчёты доступны только в личном чате.", show_alert=True)
+        return
+    if not _is_linked_telegram_id(callback.from_user.id):
+        await callback.answer("Сначала войдите в аккаунт.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    if parts == ["report", "back"]:
+        await callback.answer()
+        await callback.message.edit_text("Главное меню. Выберите раздел в меню ниже.")
+        return
+    if len(parts) != 4 or parts[1] != "week" or parts[2] not in {
+        "salary",
+        "fines",
+        "picks",
+    }:
+        await callback.answer("Запрос отчёта некорректен.", show_alert=True)
+        return
+    section, week_id_value = parts[2], parts[3]
+    try:
+        week_id = parse_week_id(week_id_value)
+    except ValueError:
+        await callback.answer("Неделя указана неверно.", show_alert=True)
+        return
+
+    if database.activity_period_exists(week_id):
+        sheets = database.activity_sheets(week_id)
+        activity = database.activity_for_employee(callback.from_user.id, week_id)
+        if activity is None:
+            await callback.answer("Сначала войдите в аккаунт.", show_alert=True)
+            return
+        if section == "salary":
+            text = (
+                "Лист «Salary» отсутствует в загруженной книге."
+                if "salary" not in sheets
+                else render_activity_report(
+                    week_id, activity, database.activity_rates(week_id)
+                )
+            )
+        elif section == "picks":
+            text = (
+                "Лист «Salary» отсутствует; данные о пиках не загружены."
+                if "salary" not in sheets
+                else render_picks_report(week_id, activity)
+            )
+        else:
+            if "mistakes" not in sheets:
+                text = "Лист «Mistakes» отсутствует в загруженной книге."
+            else:
+                fines = database.mistakes_for_employee(callback.from_user.id, week_id)
+                if fines is None:
+                    await callback.answer("Сначала войдите в аккаунт.", show_alert=True)
+                    return
+                text = render_fines_report(week_id, fines)
+    else:
+        record = database.payroll_for_week(callback.from_user.id, week_id)
+        if section == "salary" and record is not None:
+            text = render_payroll(record, "выбранную неделю")
+        elif section == "fines" and record is not None and record["values"] is not None:
+            fine_index = next(
+                (
+                    index
+                    for index, name in enumerate(record["headers"])
+                    if "штраф" in normalize_name(name)
+                ),
+                None,
+            )
+            if fine_index is None:
+                text = f"За неделю {week_label(week_id)} штрафы не указаны."
+            else:
+                amount = record["values"][fine_index - 1]
+                text = (
+                    f"⚠️ Штрафы за {week_label(week_id)}\n\n"
+                    "В старой выгрузке есть только общая сумма, без дат и причин.\n"
+                    f"💰 Общая сумма: {format_amount(amount)}"
+                )
+        elif section == "picks":
+            work = database.work_rows_for_employee(callback.from_user.id, week_id)
+            if work is None:
+                await callback.answer("Сначала войдите в аккаунт.", show_alert=True)
+                return
+            text = render_work(week_id, work)
+        else:
+            labels = {
+                "salary": "расчётный лист",
+                "fines": "штрафы",
+                "picks": "пики",
+            }
+            text = f"За неделю {week_label(week_id)} данные «{labels[section]}» не загружены."
+
+    await callback.answer()
+    await callback.message.edit_text(text, reply_markup=report_back_keyboard())
+    database.log_request(callback.from_user.id, f"report:{section}:{week_id}")
 
 
 @router.message(
@@ -1049,9 +1719,13 @@ async def upload_button(message: Message, state: FSMContext) -> None:
         return
     await discard_pending_upload(state, message.from_user.id)
     await state.clear()
-    await state.set_state(Upload.week)
-    log_action(message, "payroll_upload_week_picker")
-    await message.answer("Выберите неделю для загрузки:", reply_markup=week_picker())
+    await state.set_state(Upload.document)
+    log_action(message, "activity_upload_started")
+    await message.answer(
+        "Пришлите XLSX. Для книги с листами Salary/NTT/Mistakes недели будут "
+        "определены по датам автоматически. Для старого файла расчётного листа "
+        "используйте команду /upload ГГГГ-WНН."
+    )
 
 
 async def begin_upload(message: Message, state: FSMContext, week_value: str) -> None:
@@ -1209,16 +1883,32 @@ async def upload_document(message: Message, state: FSMContext) -> None:
         await message.answer("Файл больше допустимых 10 МБ.")
         return
     try:
+        report_payload = parse_report_workbook(content.getvalue())
+        if report_payload is not None:
+            await stage_activity_report(message, state, report_payload)
+            return
         headers, rows, work_rows = parse_workbook_with_work(content.getvalue())
         data = await state.get_data()
-        week_id = data["week_id"]
         workbook_week_id = week_id_from_headers(headers)
+        if not data.get("week_id") and workbook_week_id is None:
+            raise ValueError(
+                "Для старого формата без дат выберите неделю командой "
+                "/upload ГГГГ-WНН и отправьте файл ещё раз."
+            )
+        week_id = data.get("week_id") or workbook_week_id
+        if not data.get("week_id") and database.period_exists(week_id):
+            raise ValueError(
+                f"За {week_id} уже есть расчёт. Для безопасной замены запустите "
+                f"/upload {week_id} и подтвердите перезапись."
+            )
         if workbook_week_id and workbook_week_id != week_id:
             raise ValueError(
                 f"Даты Excel относятся к {workbook_week_id}, "
                 f"но выбрана неделя {week_id}."
             )
-        expected_uploaded_at = data.get("expected_uploaded_at")
+        expected_uploaded_at = (
+            data.get("expected_uploaded_at") if data.get("week_id") else None
+        )
         if database.period_uploaded_at(week_id) != expected_uploaded_at:
             raise database.ConcurrentPayrollUpdateError(
                 "Эту неделю уже изменил другой администратор. Загрузка отменена; проверьте данные."
@@ -1312,6 +2002,135 @@ async def upload_document(message: Message, state: FSMContext) -> None:
         logger.exception("Database error while importing payroll week %s", week_id)
         await message.answer("Не удалось сохранить расчёт из-за ошибки базы данных. Попробуйте позже.")
         return
+
+
+async def stage_activity_report(
+    message: Message, state: FSMContext, payload: dict[str, Any]
+) -> None:
+    admin_id = message.from_user.id
+    expected_versions = {
+        week_id: database.activity_period_uploaded_at(week_id)
+        for week_id in payload["weeks"]
+    }
+    token = secrets.token_hex(16)
+    database.stage_activity_upload(
+        token, admin_id, payload, expected_versions, time.time()
+    )
+    await state.update_data(activity_upload_token=token)
+    existing_weeks = [
+        week_id for week_id, version in expected_versions.items() if version is not None
+    ]
+    date_range = (
+        f"{week_label(payload['weeks'][0])} — "
+        f"{week_label(payload['weeks'][-1])}"
+    )
+    summary = (
+        f"Excel обработан: периоды {date_range} "
+        f"({len(payload['weeks'])} недель); "
+        f"операций Salary: {payload['source_counts']['Salary']}, "
+        f"NTT: {payload['source_counts']['NTT']}, "
+        f"нарушений: {payload['source_counts']['Mistakes']}; "
+        f"логинов: {len(payload['logins'])}.\n"
+        f"Тарифы: {'найдены' if payload['has_rates'] else 'не найдены — заработок не рассчитать'}; "
+        f"штрафы: {'найдены' if payload['has_fine_rates'] else 'не найдены — суммы не рассчитать'}.\n"
+        "Текущая и предыдущая недели выбираются по календарю; если дат нет в файле, "
+        "бот сообщит об отсутствии данных."
+    )
+    if existing_weeks:
+        await state.set_state(Upload.review)
+        await message.answer(
+            summary
+            + "\n\nВ файле есть недели, загруженные ранее. Заменить данные этих недель?",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Подтвердить импорт",
+                            callback_data=f"activity_upload:confirm:{token}",
+                        ),
+                        InlineKeyboardButton(
+                            text="Отмена",
+                            callback_data=f"activity_upload:cancel:{token}",
+                        ),
+                    ]
+                ]
+            ),
+        )
+        return
+    await commit_activity_report(message, state, token, admin_id, summary)
+
+
+async def commit_activity_report(
+    message: Message,
+    state: FSMContext,
+    token: str,
+    admin_id: int,
+    summary: str | None = None,
+) -> None:
+    if not database.is_admin(admin_id):
+        database.delete_staged_activity_upload(token, admin_id)
+        await state.clear()
+        await message.answer("Доступ к загрузке отозван. Импорт отменён.")
+        return
+    staged = database.get_staged_activity_upload(token, admin_id, time.time())
+    if staged is None:
+        await state.clear()
+        await message.answer("Срок подтверждения истёк. Загрузите файл заново.")
+        return
+    try:
+        database.save_activity_upload(
+            staged["payload"], staged["expected_versions"], check_versions=True
+        )
+    except database.ConcurrentPayrollUpdateError as exc:
+        database.delete_staged_activity_upload(token, admin_id)
+        await state.clear()
+        await message.answer(str(exc), reply_markup=keyboard(True))
+        return
+    except sqlite3.Error:
+        logger.exception("Could not save uploaded operational report")
+        await message.answer("Не удалось сохранить Excel в базу. Попробуйте позже.")
+        return
+    database.delete_staged_activity_upload(token, admin_id)
+    await state.clear()
+    log_action_from_id(admin_id, "activity_report_uploaded")
+    await message.answer(
+        (summary or "Excel сохранён.") + "\n\n✅ Данные сохранены по неделям.",
+        reply_markup=keyboard(True),
+    )
+
+
+@router.callback_query(F.data.startswith("activity_upload:"))
+async def activity_upload_selected(
+    callback: CallbackQuery, state: FSMContext
+) -> None:
+    if not is_private_admin_callback(callback) or not callback.message:
+        await callback.answer("Доступ только для администратора.", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    if (
+        len(parts) != 3
+        or parts[1] not in {"confirm", "cancel"}
+        or not re.fullmatch(r"[a-f0-9]{32}", parts[2])
+    ):
+        await callback.answer("Кнопка импорта недействительна.", show_alert=True)
+        return
+    token = parts[2]
+    staged = database.get_staged_activity_upload(token, callback.from_user.id, time.time())
+    if staged is None:
+        await state.clear()
+        await callback.answer("Срок подтверждения истёк.", show_alert=True)
+        await callback.message.edit_text("Срок подтверждения истёк. Загрузите файл заново.")
+        return
+    if parts[1] == "cancel":
+        database.delete_staged_activity_upload(token, callback.from_user.id)
+        await state.clear()
+        await callback.answer()
+        await callback.message.edit_text("Импорт отменён; данные в базе не менялись.")
+        return
+    await callback.answer()
+    await commit_activity_report(
+        callback.message, state, token, callback.from_user.id
+    )
 
 
 async def commit_staged_upload(
@@ -1413,7 +2232,7 @@ async def employee_list(message: Message, state: FSMContext) -> None:
         return
     output = io.StringIO(newline="")
     writer = csv.writer(output)
-    writer.writerow(["ФИО", "Пароль настроен", "Telegram привязан"])
+    writer.writerow(["Логин / ФИО", "Пароль настроен", "Telegram привязан"])
     writer.writerows(
         [
             [
@@ -1455,7 +2274,7 @@ async def generate_passwords(message: Message, state: FSMContext) -> None:
 
     output = io.StringIO(newline="")
     writer = csv.writer(output)
-    writer.writerow(["ФИО", "Пароль"])
+    writer.writerow(["Логин / ФИО", "Пароль"])
     generated: set[str] = set()
     password_hashes: list[tuple[int, bytes]] = []
     for employee in employees:
@@ -1501,7 +2320,7 @@ async def reset_password_command(
     if not name:
         await state.clear()
         await state.set_state(ResetPassword.employee_name)
-        await message.answer("Введите ФИО сотрудника для сброса пароля.")
+        await message.answer("Введите логин или ФИО сотрудника для сброса пароля.")
         return
     await state.clear()
     await issue_password(message, name)
@@ -1515,7 +2334,7 @@ async def reset_password_button(message: Message, state: FSMContext) -> None:
         return
     await clear_workflow(state, message.from_user.id)
     await state.set_state(ResetPassword.employee_name)
-    await message.answer("Введите ФИО сотрудника для сброса пароля.")
+    await message.answer("Введите логин или ФИО сотрудника для сброса пароля.")
 
 
 @router.message(
@@ -1761,7 +2580,9 @@ async def help_command(message: Message, state: FSMContext) -> None:
     await clear_workflow(state, message.from_user.id if message.from_user else None)
     log_action(message, "help")
     text = (
-        "Сотрудник: кнопки «Войти», «Текущая неделя», «Предыдущая неделя», «Выйти».\n"
+        "Сотрудник: «📊 Расчётный лист», «⚠️ Штрафы», «📦 Пики»; "
+        "в каждом разделе выберите текущую или предыдущую неделю. "
+        "Для входа используйте логин Login и пароль из CSV администратора.\n"
         "Администратор: кнопки меню — загрузка Excel, сотрудники, пароли и управление. "
         "Также доступны /upload ГГГГ-WНН и /status; "
         "/generate_passwords — получить CSV паролей новых сотрудников; "

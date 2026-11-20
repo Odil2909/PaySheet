@@ -28,11 +28,16 @@ from payroll_bot import (
     is_private_admin_callback,
     keyboard,
     parse_week_id,
+    parse_report_workbook,
     parse_workbook,
     parse_workbook_with_work,
     payroll_diff_file,
     render_payroll,
+    render_activity_report,
+    render_fines_report,
+    render_picks_report,
     render_work,
+    report_week_picker,
     roster_review,
     start,
     upload_start,
@@ -59,13 +64,140 @@ class PayrollBotTests(unittest.TestCase):
         employee_buttons = {button.text for row in keyboard().keyboard for button in row}
         owner_buttons = {button.text for row in keyboard(owner=True).keyboard for button in row}
         self.assertIn("🔐 Войти", employee_buttons)
-        self.assertIn("📅 Текущая неделя", employee_buttons)
-        self.assertIn("📦 Работа и пики", employee_buttons)
+        self.assertEqual(
+            employee_buttons
+            & {"📊 Расчётный лист", "⚠️ Штрафы", "📦 Пики"},
+            {"📊 Расчётный лист", "⚠️ Штрафы", "📦 Пики"},
+        )
+        self.assertNotIn("📅 Текущая неделя", employee_buttons)
+        self.assertNotIn("📦 Работа и пики", employee_buttons)
         self.assertNotIn("📤 Загрузить Excel", employee_buttons)
         self.assertIn("📤 Загрузить Excel", owner_buttons)
         self.assertIn("🔑 Пароли сотрудников", owner_buttons)
         self.assertIn("🔄 Сброс пароля", owner_buttons)
         self.assertIn("⚙️ Администрирование", owner_buttons)
+
+    @staticmethod
+    def make_operational_xlsx() -> bytes:
+        workbook = Workbook()
+        salary = workbook.active
+        salary.title = "Salary"
+        salary.append(["Process", "Login", "Start Date", date(2026, 11, 9), date(2026, 11, 10)])
+        salary.append(["Picking Items", "user.one", date(2026, 1, 1), 10, 0])
+        salary.append(["Putaway", "user.one", date(2026, 1, 1), 5, 0])
+        ntt = workbook.create_sheet("NTT")
+        ntt.append(["Process", "Login", date(2026, 11, 9)])
+        ntt.append(["Sort", "user.one", 2])
+        mistakes = workbook.create_sheet("Mistakes")
+        mistakes.append(
+            [
+                "Отдел",
+                "Дата выявления нарушения",
+                "Смена OPS",
+                "Тип смены",
+                "Процесс",
+                "Login (нарушитель)",
+                "Login (контролер)",
+                "Пункт",
+                "Нарушение",
+                "Комментарий",
+                "Дата совершения нарушения",
+                "UnitLoad/заказ/контейнер",
+                "Количество единиц/ нарушений",
+                "Потребность в доп обучении",
+            ]
+        )
+        mistakes.append(
+            [
+                "OPS",
+                date(2026, 11, 10),
+                1,
+                "День",
+                "Putaway",
+                "USER.ONE",
+                "",
+                "Пункт 1",
+                "Повреждение товара",
+                "",
+                date(2026, 11, 9),
+                "UNIT-1",
+                2,
+                "",
+            ]
+        )
+        rates = workbook.create_sheet("Rates")
+        rates.append(["Process", "Ставка за единицу"])
+        rates.append(["Picking Items", 2])
+        rates.append(["Putaway", 1])
+        rates.append(["Sort", 3])
+        fine_rates = workbook.create_sheet("FineRates")
+        fine_rates.append(["Нарушение", "Сумма за единицу"])
+        fine_rates.append(["Повреждение товара", 15])
+        output = io.BytesIO()
+        workbook.save(output)
+        return output.getvalue()
+
+    def test_multi_sheet_report_import_and_weekly_report_queries(self) -> None:
+        payload = parse_report_workbook(self.make_operational_xlsx())
+        self.assertIsNotNone(payload)
+        week_id = "2026-W46"
+        self.assertIn(week_id, payload["weeks"])
+        self.assertEqual(len(payload["logins"]), 1)
+        self.assertTrue(payload["has_rates"])
+        self.assertTrue(payload["has_fine_rates"])
+        expected = {value: None for value in payload["weeks"]}
+        database.save_activity_upload(payload, expected)
+
+        employee = database.employee_by_name("user.one")
+        self.assertIsNotNone(employee)
+        self.assertTrue(database.link_telegram_account(employee["id"], 456))
+        activity = database.activity_for_employee(456, week_id)
+        self.assertEqual(len(activity), 5)
+        self.assertIn(
+            "📅 09.11 — 31.00",
+            render_activity_report(week_id, activity, database.activity_rates(week_id)),
+        )
+        self.assertIn(
+            "📦 Обработано товаров: 15",
+            render_activity_report(week_id, activity, database.activity_rates(week_id)),
+        )
+        self.assertIn(
+            "💰 ИТОГО: 31.00",
+            render_activity_report(week_id, activity, database.activity_rates(week_id)),
+        )
+        self.assertIn("Итого пиков: 10 шт.", render_picks_report(week_id, activity))
+
+        fines = database.mistakes_for_employee(456, week_id)
+        self.assertEqual(len(fines), 1)
+        self.assertEqual(fines[0]["fine_rate"], "15")
+        self.assertIn(
+            "💰 Общая сумма штрафов: 30.00",
+            render_fines_report(week_id, fines),
+        )
+
+    def test_report_import_preserves_other_employees_and_missing_rates_are_explicit(self) -> None:
+        payload = parse_report_workbook(self.make_operational_xlsx())
+        database.save_activity_upload(
+            payload, {week_id: None for week_id in payload["weeks"]}
+        )
+        employee = database.employee_by_name("user.one")
+        other = database.employee_by_name("another.employee")
+        if other is None:
+            database.save_payroll(
+                "2026-W46",
+                ["ФИО"] + ["День"] * 7 + ["Штрафы", "Итого"],
+                [("another.employee", "another.employee", ["0"] * 9)],
+            )
+            other = database.employee_by_name("another.employee")
+        self.assertTrue(database.link_telegram_account(employee["id"], 456))
+        self.assertTrue(database.link_telegram_account(other["id"], 789))
+        self.assertEqual(database.activity_for_employee(789, "2026-W46"), [])
+        self.assertEqual(database.mistakes_for_employee(789, "2026-W46"), [])
+
+        activity = database.activity_for_employee(456, "2026-W46")
+        text = render_activity_report("2026-W46", activity, {})
+        self.assertIn("не рассчитано", text)
+        self.assertNotIn("💰 ИТОГО: 31.00", text)
 
     def test_money_uses_decimal_rounding_and_grouping(self) -> None:
         self.assertEqual(format_amount("6170.866200000001"), "6 170.87")
@@ -109,6 +241,17 @@ class PayrollBotTests(unittest.TestCase):
             "upload_week:custom",
             [row[0].callback_data for row in picker.inline_keyboard],
         )
+        for section in ("salary", "fines", "picks"):
+            report_picker = report_week_picker(section)
+            callbacks = [row[0].callback_data for row in report_picker.inline_keyboard]
+            self.assertEqual(len(callbacks), 3)
+            self.assertTrue(
+                all(
+                    value.startswith(f"report:week:{section}:")
+                    for value in callbacks[:2]
+                )
+            )
+            self.assertEqual(callbacks[2], "report:back")
 
     @staticmethod
     def make_xlsx(rows: list[list[object]]) -> bytes:

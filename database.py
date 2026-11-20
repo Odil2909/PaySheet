@@ -89,8 +89,59 @@ def initialize(config_admin_ids: set[int] | None = None) -> None:
                 picks TEXT NOT NULL,
                 PRIMARY KEY (week_id, employee_id, row_order)
             );
+            CREATE TABLE IF NOT EXISTS activity_periods (
+                week_id TEXT PRIMARY KEY,
+                uploaded_at TEXT NOT NULL,
+                sheets_json TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE TABLE IF NOT EXISTS activity_rows (
+                week_id TEXT NOT NULL REFERENCES activity_periods(week_id) ON DELETE CASCADE,
+                employee_id INTEGER NOT NULL REFERENCES employees(id),
+                activity_date TEXT NOT NULL,
+                source TEXT NOT NULL,
+                process TEXT NOT NULL,
+                quantity TEXT NOT NULL,
+                PRIMARY KEY (week_id, employee_id, activity_date, source, process)
+            );
+            CREATE TABLE IF NOT EXISTS activity_rates (
+                week_id TEXT NOT NULL REFERENCES activity_periods(week_id) ON DELETE CASCADE,
+                process TEXT NOT NULL,
+                rate TEXT NOT NULL,
+                PRIMARY KEY (week_id, process)
+            );
+            CREATE TABLE IF NOT EXISTS fine_rates (
+                week_id TEXT NOT NULL REFERENCES activity_periods(week_id) ON DELETE CASCADE,
+                violation TEXT NOT NULL,
+                rate TEXT NOT NULL,
+                PRIMARY KEY (week_id, violation)
+            );
+            CREATE TABLE IF NOT EXISTS mistake_rows (
+                week_id TEXT NOT NULL REFERENCES activity_periods(week_id) ON DELETE CASCADE,
+                employee_id INTEGER NOT NULL REFERENCES employees(id),
+                source_row INTEGER NOT NULL,
+                occurred_on TEXT NOT NULL,
+                identified_on TEXT,
+                process TEXT NOT NULL,
+                point TEXT NOT NULL,
+                violation TEXT NOT NULL,
+                comment TEXT NOT NULL,
+                unit_identifier TEXT NOT NULL,
+                quantity TEXT NOT NULL,
+                PRIMARY KEY (week_id, employee_id, source_row)
+            );
+            CREATE TABLE IF NOT EXISTS activity_upload_staging (
+                token TEXT PRIMARY KEY,
+                admin_id INTEGER NOT NULL,
+                payload_json TEXT NOT NULL,
+                expected_versions_json TEXT NOT NULL,
+                created_at REAL NOT NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_payroll_rows_employee
                 ON payroll_rows(employee_id, week_id);
+            CREATE INDEX IF NOT EXISTS idx_activity_rows_employee
+                ON activity_rows(employee_id, week_id, activity_date);
+            CREATE INDEX IF NOT EXISTS idx_mistake_rows_employee
+                ON mistake_rows(employee_id, week_id, occurred_on);
             CREATE INDEX IF NOT EXISTS idx_request_log_created_at
                 ON request_log(created_at);
             """
@@ -104,9 +155,22 @@ def initialize(config_admin_ids: set[int] | None = None) -> None:
                 "ALTER TABLE payroll_upload_staging "
                 "ADD COLUMN work_rows_json TEXT NOT NULL DEFAULT '[]'"
             )
+        activity_period_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(activity_periods)")
+        }
+        if "sheets_json" not in activity_period_columns:
+            connection.execute(
+                "ALTER TABLE activity_periods "
+                "ADD COLUMN sheets_json TEXT NOT NULL DEFAULT '[]'"
+            )
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute(
             "DELETE FROM payroll_upload_staging WHERE created_at < ?",
+            (datetime.now(timezone.utc).timestamp() - 3600,),
+        )
+        connection.execute(
+            "DELETE FROM activity_upload_staging WHERE created_at < ?",
             (datetime.now(timezone.utc).timestamp() - 3600,),
         )
         connection.execute("DELETE FROM admins WHERE source = 'config'")
@@ -323,6 +387,254 @@ def period_headers(week_id: str) -> list[str] | None:
             "SELECT headers_json FROM periods WHERE week_id = ?", (week_id,)
         ).fetchone()
     return json.loads(row["headers_json"]) if row else None
+
+
+def activity_period_uploaded_at(week_id: str) -> str | None:
+    with _connect() as connection:
+        row = connection.execute(
+            "SELECT uploaded_at FROM activity_periods WHERE week_id = ?", (week_id,)
+        ).fetchone()
+    return row["uploaded_at"] if row else None
+
+
+def stage_activity_upload(
+    token: str,
+    admin_id: int,
+    payload: dict[str, Any],
+    expected_versions: dict[str, str | None],
+    created_at: float,
+) -> None:
+    with _connect() as connection:
+        connection.execute(
+            "DELETE FROM activity_upload_staging WHERE created_at < ?",
+            (created_at - 3600,),
+        )
+        connection.execute(
+            """
+            INSERT INTO activity_upload_staging
+                (token, admin_id, payload_json, expected_versions_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                token,
+                admin_id,
+                json.dumps(payload, ensure_ascii=False),
+                json.dumps(expected_versions, ensure_ascii=False),
+                created_at,
+            ),
+        )
+
+
+def get_staged_activity_upload(
+    token: str, admin_id: int, now: float
+) -> dict[str, Any] | None:
+    with _connect() as connection:
+        row = connection.execute(
+            """
+            SELECT payload_json, expected_versions_json
+            FROM activity_upload_staging
+            WHERE token = ? AND admin_id = ? AND created_at >= ?
+            """,
+            (token, admin_id, now - 3600),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "payload": json.loads(row["payload_json"]),
+        "expected_versions": json.loads(row["expected_versions_json"]),
+    }
+
+
+def delete_staged_activity_upload(token: str, admin_id: int) -> None:
+    with _connect() as connection:
+        connection.execute(
+            "DELETE FROM activity_upload_staging WHERE token = ? AND admin_id = ?",
+            (token, admin_id),
+        )
+
+
+def save_activity_upload(
+    payload: dict[str, Any],
+    expected_versions: dict[str, str | None],
+    check_versions: bool = True,
+) -> None:
+    weeks = sorted(payload["weeks"])
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        if check_versions:
+            for week_id in weeks:
+                row = connection.execute(
+                    "SELECT uploaded_at FROM activity_periods WHERE week_id = ?",
+                    (week_id,),
+                ).fetchone()
+                current_version = row["uploaded_at"] if row else None
+                if current_version != expected_versions.get(week_id):
+                    raise ConcurrentPayrollUpdateError(
+                        f"Неделя {week_id} уже изменилась. Импорт отменён; проверьте книгу."
+                    )
+
+        logins = payload["logins"]
+        connection.executemany(
+            """
+            INSERT INTO employees (normalized_name, display_name)
+            VALUES (?, ?)
+            ON CONFLICT(normalized_name) DO NOTHING
+            """,
+            [(login["normalized"], login["display"]) for login in logins],
+        )
+        employee_ids = {
+            row["normalized_name"]: row["id"]
+            for row in connection.execute(
+                "SELECT id, normalized_name FROM employees"
+            )
+        }
+
+        for week_id in weeks:
+            connection.execute(
+                """
+                INSERT INTO activity_periods (week_id, uploaded_at)
+                VALUES (?, ?)
+                ON CONFLICT(week_id) DO UPDATE SET
+                    uploaded_at = excluded.uploaded_at
+                """,
+                (week_id, now),
+            )
+            connection.execute(
+                "UPDATE activity_periods SET sheets_json = ? WHERE week_id = ?",
+                (json.dumps(payload["sheets"], ensure_ascii=False), week_id),
+            )
+            for table in ("activity_rows", "activity_rates", "fine_rates", "mistake_rows"):
+                connection.execute(f"DELETE FROM {table} WHERE week_id = ?", (week_id,))
+
+            weekly = payload["periods"][week_id]
+            connection.executemany(
+                """
+                INSERT INTO activity_rows
+                    (week_id, employee_id, activity_date, source, process, quantity)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        week_id,
+                        employee_ids[row["login"]],
+                        row["date"],
+                        row["source"],
+                        row["process"],
+                        row["quantity"],
+                    )
+                    for row in weekly["activities"]
+                ],
+            )
+            connection.executemany(
+                """
+                INSERT INTO mistake_rows
+                    (week_id, employee_id, source_row, occurred_on, identified_on,
+                     process, point, violation, comment, unit_identifier, quantity)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        week_id,
+                        employee_ids[row["login"]],
+                        row["source_row"],
+                        row["occurred_on"],
+                        row["identified_on"],
+                        row["process"],
+                        row["point"],
+                        row["violation"],
+                        row["comment"],
+                        row["unit_identifier"],
+                        row["quantity"],
+                    )
+                    for row in weekly["mistakes"]
+                ],
+            )
+            connection.executemany(
+                "INSERT INTO activity_rates (week_id, process, rate) VALUES (?, ?, ?)",
+                [(week_id, process, rate) for process, rate in weekly["rates"]],
+            )
+            connection.executemany(
+                "INSERT INTO fine_rates (week_id, violation, rate) VALUES (?, ?, ?)",
+                [(week_id, violation, rate) for violation, rate in weekly["fine_rates"]],
+            )
+
+
+def activity_period_exists(week_id: str) -> bool:
+    with _connect() as connection:
+        return (
+            connection.execute(
+                "SELECT 1 FROM activity_periods WHERE week_id = ?", (week_id,)
+            ).fetchone()
+            is not None
+        )
+
+
+def activity_sheets(week_id: str) -> set[str]:
+    with _connect() as connection:
+        row = connection.execute(
+            "SELECT sheets_json FROM activity_periods WHERE week_id = ?", (week_id,)
+        ).fetchone()
+    return set(json.loads(row["sheets_json"])) if row else set()
+
+
+def activity_for_employee(telegram_id: int, week_id: str) -> list[dict[str, str]] | None:
+    with _connect() as connection:
+        employee = connection.execute(
+            "SELECT id FROM employees WHERE telegram_id = ?", (telegram_id,)
+        ).fetchone()
+        if employee is None:
+            return None
+        rows = connection.execute(
+            """
+            SELECT activity_date, source, process, quantity
+            FROM activity_rows
+            WHERE week_id = ? AND employee_id = ?
+            ORDER BY activity_date, source, process
+            """,
+            (week_id, employee["id"]),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def mistakes_for_employee(telegram_id: int, week_id: str) -> list[dict[str, str]] | None:
+    with _connect() as connection:
+        employee = connection.execute(
+            "SELECT id FROM employees WHERE telegram_id = ?", (telegram_id,)
+        ).fetchone()
+        if employee is None:
+            return None
+        rows = connection.execute(
+            """
+            SELECT occurred_on, identified_on, process, point, violation, comment,
+                   unit_identifier, quantity
+            FROM mistake_rows
+            WHERE week_id = ? AND employee_id = ?
+            ORDER BY occurred_on, source_row
+            """,
+            (week_id, employee["id"]),
+        ).fetchall()
+        rates = connection.execute(
+            "SELECT violation, rate FROM fine_rates WHERE week_id = ?", (week_id,)
+        ).fetchall()
+    rate_by_violation = {
+        row["violation"].strip().casefold(): row["rate"] for row in rates
+    }
+    return [
+        {
+            **dict(row),
+            "fine_rate": rate_by_violation.get(row["violation"].strip().casefold()),
+        }
+        for row in rows
+    ]
+
+
+def activity_rates(week_id: str) -> dict[str, str]:
+    with _connect() as connection:
+        rows = connection.execute(
+            "SELECT process, rate FROM activity_rates WHERE week_id = ?", (week_id,)
+        ).fetchall()
+    return {row["process"].strip().casefold(): row["rate"] for row in rows}
 
 
 def work_rows_for_employee(telegram_id: int, week_id: str) -> list[dict[str, str]] | None:
