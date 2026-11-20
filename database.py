@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import Any
 
 
-DATABASE_PATH = Path(__file__).with_name("payroll.sqlite3")
+DATABASE_PATH = Path(
+    os.getenv("PAYROLL_DB_PATH", str(Path(__file__).with_name("payroll.sqlite3")))
+)
 
 
 class ConcurrentPayrollUpdateError(RuntimeError):
@@ -24,6 +26,7 @@ def _connect() -> sqlite3.Connection:
 
 
 def initialize(config_admin_ids: set[int] | None = None) -> None:
+    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _connect() as connection:
         connection.executescript(
             """
